@@ -1,0 +1,11 @@
+{
+  "webhooks": {
+    "connect": " ",
+    "disconnect": " ",
+    "upload": " ",
+    "failure": " "
+  },
+  "auth_log": "/var/log/auth.log",
+  "upload_dirs": [],
+  "poll_seconds": 2
+}
