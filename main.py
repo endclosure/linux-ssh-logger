@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import json
 import re
 import signal
@@ -22,6 +23,9 @@ UPLOAD_DIRS = [Path(p).expanduser() for p in CONFIG.get("upload_dirs", [])]
 POLL_SECONDS = max(1, int(CONFIG.get("poll_seconds", 2)))
 running = True
 BLOCKED_HOOKS: set[str] = set()
+PROXY_LOOKUP_ENABLED = CONFIG.get("proxy_lookup_enabled", True)
+PROXY_LOOKUP_TIMEOUT = max(1, float(CONFIG.get("proxy_lookup_timeout", 3)))
+PROXY_RESULTS: dict[str, str] = {}
 
 IP = r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,}"
 ACCEPTED = re.compile(rf"Accepted \S+ for (\S+) from ({IP}) port (\d+)")
@@ -29,6 +33,30 @@ FAILED = re.compile(rf"Failed \S+ for (?:invalid user )?(\S+) from ({IP}) port (
 INVALID = re.compile(rf"Invalid user (\S+) from ({IP})")
 DISCONNECTED = re.compile(rf"Disconnected from (?:authenticating )?user (\S+)(?:\s+({IP})\s+port\s+(\d+))?")
 SESSION_CLOSE = re.compile(r"pam_unix\(sshd:session\): session closed for user (\S+)")
+
+
+def check_proxy_vpn(ip: str) -> str:
+    if ip in PROXY_RESULTS:
+        return PROXY_RESULTS[ip]
+    if not PROXY_LOOKUP_ENABLED:
+        return "Lookup disabled"
+    try:
+        address = ipaddress.ip_address(ip)
+        if not address.is_global:
+            result = "No (non-public IP)"
+        else:
+            url = f"http://ip-api.com/json/{address}?fields=status,message,proxy"
+            req = urllib.request.Request(url, headers={"User-Agent": "ssh-log-notifier/1.0"})
+            with urllib.request.urlopen(req, timeout=PROXY_LOOKUP_TIMEOUT) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data.get("status") != "success":
+                raise ValueError(data.get("message", "lookup failed"))
+            result = "Yes (proxy/VPN/Tor)" if data.get("proxy") else "No"
+    except (ValueError, OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        result = f"Lookup unavailable ({str(exc)[:100]})"
+    if not result.startswith("Lookup unavailable"):
+        PROXY_RESULTS[ip] = result
+    return result
 
 
 def post(kind: str, fields: dict[str, str]) -> None:
@@ -126,7 +154,8 @@ def watch_auth():
         if m:
             user, ip = m.group(1), m.group(2)
             print(f"Detected SSH login failure for {user} from {ip}", flush=True)
-            post("failure", {"User": user, "Client IP": ip})
+            proxy_status = check_proxy_vpn(ip)
+            post("failure", {"User": user, "Client IP": ip, "Proxy/VPN/Tor": proxy_status})
             continue
         m = DISCONNECTED.search(line)
         if m:
