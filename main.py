@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import ipaddress
+from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
 import signal
@@ -25,7 +27,9 @@ running = True
 BLOCKED_HOOKS: set[str] = set()
 PROXY_LOOKUP_ENABLED = CONFIG.get("proxy_lookup_enabled", True)
 PROXY_LOOKUP_TIMEOUT = max(1, float(CONFIG.get("proxy_lookup_timeout", 3)))
-PROXY_RESULTS: dict[str, str] = {}
+PROXY_RESULTS: dict[str, dict[str, str]] = {}
+FAILED_IPS: dict[str, dict[str, str]] = {}
+STATUS_PATH = "/13139123kajhwaakjhb234ju1g24o1i248y12l34knbl2k34j1496t234918643"
 
 IP = r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,}"
 ACCEPTED = re.compile(rf"Accepted \S+ for (\S+) from ({IP}) port (\d+)")
@@ -35,26 +39,31 @@ DISCONNECTED = re.compile(rf"Disconnected from (?:authenticating )?user (\S+)(?:
 SESSION_CLOSE = re.compile(r"pam_unix\(sshd:session\): session closed for user (\S+)")
 
 
-def check_proxy_vpn(ip: str) -> str:
+def check_proxy_vpn(ip: str) -> dict[str, str]:
     if ip in PROXY_RESULTS:
         return PROXY_RESULTS[ip]
     if not PROXY_LOOKUP_ENABLED:
-        return "Lookup disabled"
+        return {"status": "Lookup disabled", "proxy": "Unknown", "state": "Unknown", "city": "Unknown"}
     try:
         address = ipaddress.ip_address(ip)
         if not address.is_global:
-            result = "No (non-public IP)"
+            result = {"status": "No (non-public IP)", "proxy": "false", "state": "Unknown", "city": "Unknown"}
         else:
-            url = f"http://ip-api.com/json/{address}?fields=status,message,proxy"
+            url = f"http://ip-api.com/json/{address}?fields=status,message,proxy,regionName,city"
             req = urllib.request.Request(url, headers={"User-Agent": "ssh-log-notifier/1.0"})
             with urllib.request.urlopen(req, timeout=PROXY_LOOKUP_TIMEOUT) as response:
                 data = json.loads(response.read().decode("utf-8"))
             if data.get("status") != "success":
                 raise ValueError(data.get("message", "lookup failed"))
-            result = "Yes (proxy/VPN/Tor)" if data.get("proxy") else "No"
+            result = {
+                "status": "Yes (proxy/VPN/Tor)" if data.get("proxy") else "No",
+                "proxy": "true" if data.get("proxy") else "false",
+                "state": str(data.get("regionName") or "Unknown"),
+                "city": str(data.get("city") or "Unknown"),
+            }
     except (ValueError, OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        result = f"Lookup unavailable ({str(exc)[:100]})"
-    if not result.startswith("Lookup unavailable"):
+        result = {"status": f"Lookup unavailable ({str(exc)[:100]})", "proxy": "Unknown", "state": "Unknown", "city": "Unknown"}
+    if not result["status"].startswith("Lookup unavailable"):
         PROXY_RESULTS[ip] = result
     return result
 
@@ -67,12 +76,15 @@ def post(kind: str, fields: dict[str, str]) -> None:
         print(f"No webhook configured for {kind}; event skipped", file=sys.stderr)
         return
     names = {"connect": "SSH connection", "disconnect": "SSH disconnection",
-             "upload": "New file", "failure": "SSH login failed"}
+             "upload": "New file", "failure": "SSH login failed", "started": "Started"}
     embed = {"title": names[kind], "fields": [
         {"name": key, "value": str(value)[:900], "inline": True}
         for key, value in fields.items() if value
     ]}
-    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    if kind == "started":
+        payload = json.dumps({"content": "file is started and logging"}).encode("utf-8")
+    else:
+        payload = json.dumps({"embeds": [embed]}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={
         "Content-Type": "application/json",
         "User-Agent": "ssh-log-notifier/1.0",
@@ -148,14 +160,18 @@ def watch_auth():
             user, ip, port = m.groups()
             print(f"Detected SSH connection for {user} from {ip}", flush=True)
             sessions.setdefault(user, set()).add(ip)
-            post("connect", {"User": user, "Client IP": ip, "Source port": port})
+            lookup = check_proxy_vpn(ip)
+            post("connect", {"User": user, "Client IP": ip, "Source port": port,
+                              "Proxy/VPN/Tor": lookup["status"], "State": lookup["state"], "City": lookup["city"]})
             continue
         m = FAILED.search(line) or INVALID.search(line)
         if m:
             user, ip = m.group(1), m.group(2)
             print(f"Detected SSH login failure for {user} from {ip}", flush=True)
-            proxy_status = check_proxy_vpn(ip)
-            post("failure", {"User": user, "Client IP": ip, "Proxy/VPN/Tor": proxy_status})
+            lookup = check_proxy_vpn(ip)
+            FAILED_IPS[ip] = {"ip": ip, **lookup}
+            post("failure", {"User": user, "Client IP": ip, "Proxy/VPN/Tor": lookup["status"],
+                             "State": lookup["state"], "City": lookup["city"]})
             continue
         m = DISCONNECTED.search(line)
         if m:
@@ -209,13 +225,43 @@ def stop(_signum, _frame):
     running = False
 
 
+def start_status_server() -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != STATUS_PATH:
+                self.send_error(404)
+                return
+            rows = "".join(
+                "<tr>" + "".join(f"<td>{escape(row.get(key, ''))}</td>" for key in ("ip", "proxy", "state", "city")) + "</tr>"
+                for row in FAILED_IPS.values()
+            )
+            body = ("<!doctype html><meta charset='utf-8'><title>Failed SSH IPs</title>"
+                    "<h1>Failed SSH IPs</h1><table border='1'><thead><tr><th>IP</th><th>Proxy/VPN (true/false)</th><th>State</th><th>City</th></tr></thead>"
+                    f"<tbody>{rows}</tbody></table>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer((CONFIG.get("status_host", "0.0.0.0"), int(CONFIG.get("status_port", 8080))), Handler)
+    server.daemon_threads = True
+    print(f"Failed-IP page listening on port {server.server_port} at {STATUS_PATH}", flush=True)
+    server.serve_forever(poll_interval=0.5)
+
+
 def main() -> None:
     if sys.platform != "linux":
         raise SystemExit("Run this service on the Linux VPS that runs OpenSSH.")
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     import threading
+    post("started", {})
     threading.Thread(target=watch_auth, daemon=True).start()
+    threading.Thread(target=start_status_server, daemon=True).start()
     if UPLOAD_DIRS:
         threading.Thread(target=scan_upload_dirs, daemon=True).start()
     while running:
